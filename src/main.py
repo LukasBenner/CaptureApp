@@ -169,20 +169,32 @@ def main():
                 rsync_status_line = ""
                 rsync_error_line = ""
                 last_rsync_time = time.time()
-                result = subprocess.run(['mount', '/dev/sda1', '/mnt/usb'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                if result.returncode != 0:
-                    rsync_error_line = result.stdout.decode('utf-8') if result.stdout else "Error mounting USB drive."
-                    return
-                proc = subprocess.Popen(['rsync', '--remove-source-files', '-av', f"{args.data_dir}/", "/mnt/usb/data_capture/"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                ret = proc.wait()
-                if ret != 0:
-                    rsync_error_line = "Error syncing files to USB drive."
-                else:
-                    rsync_status_line = "Sync of files to USB drive completed."
-                result = subprocess.run(['umount', '/mnt/usb'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                if result.returncode != 0:
-                    rsync_error_line = result.stdout.decode('utf-8') if result.stdout else "Error unmounting USB drive."
-                    return
+                try:
+                    result = subprocess.run(['mount', '/dev/sda1', '/mnt/usb'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    if result.returncode != 0:
+                        rsync_error_line = result.stdout.decode('utf-8') if result.stdout else "Error mounting USB drive."
+                        print(f"Mount error: {rsync_error_line}")
+                        raise RuntimeError(rsync_error_line)
+
+                    proc = subprocess.Popen(['rsync', '--remove-source-files', '-az', f"{args.data_dir}/", "/mnt/usb/data_capture/"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    ret = proc.wait()
+                    output = proc.stdout.read().decode('utf-8') if proc.stdout else ""
+                    if ret != 0:
+                        rsync_error_line = f"Error syncing files to USB drive. Output: {output}"
+                        print(f"Rsync error: {rsync_error_line}")
+                        raise RuntimeError(rsync_error_line)
+                    else:
+                        rsync_status_line = "Sync of files to USB drive completed."
+
+                except Exception as e:
+                    rsync_error_line = str(e)
+                finally:
+                    result = subprocess.run(['umount', '/mnt/usb'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    if result.returncode != 0:
+                        unmount_error = result.stdout.decode('utf-8') if result.stdout else "Error unmounting USB drive."
+                        print(f"Unmount error: {unmount_error}")
+                        rsync_error_line = unmount_error
+                        # Do not raise here, just report
                 
     cv2.setMouseCallback(window_name, on_mouse)
 

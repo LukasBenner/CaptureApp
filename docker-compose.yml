@@ -22,8 +22,6 @@ services:
     security_opt:
       - seccomp=unconfined
     environment:
-      UID: 1000
-      GID: 1000
       TZ: "Europe/Berlin"
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: all
@@ -34,8 +32,8 @@ services:
       GST_PLUGIN_PATH: /home/GX100_Application/gst-plugins
     volumes:
       - /multireader-trigger:/multireader-trigger
-      - /home/aesculap/CaptureApp:/workspace/CaptureApp
-      - /home/aesculap/.ssh:/root/.ssh
+      - /home/aesculap/CaptureApp/src:/workspace/CaptureApp
+      - /home/aesculap/CaptureApp/station_metadata.json:/workspace/CaptureApp/station_metadata.json
       - /data/lens:/data/lens
       - /sys/class/hwmon/hwmon1/temp1_input:/sys/class/hwmon/hwmon1/temp1_input:ro
       - /tmp/argus_socket:/tmp/argus_socket
