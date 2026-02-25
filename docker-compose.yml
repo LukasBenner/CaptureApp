@@ -8,7 +8,6 @@ services:
     image: captureapp:local
     container_name: captureapp
     restart: unless-stopped
-    user: root
     privileged: true
     runtime: nvidia
     working_dir: /workspace/CaptureApp
