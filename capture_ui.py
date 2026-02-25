@@ -1,20 +1,27 @@
+import datetime
+import json
 import pathlib
 import time
 
 import cv2
 import numpy as np
+import uuid
+import hashlib
 
 
 class CaptureUI:
-    def __init__(self, class_names: list[str], data_dir: str, display_w: int):
+    def __init__(self, class_names: list[str], data_dir: str, meta_data_path: str, display_w: int):
         self.class_names = class_names
         self.selected_idx = 0
-        self.instance_id = 1
-        self.instance_image_id = 1
+        self.instance_id = uuid.uuid4()
+        self.capture_id = 0
+        self.instance_counter = 0
         self.data_dir = pathlib.Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.display_w = display_w
         self.buttons: list[dict[str, int | str]] = []
+
+        self.station_metadata = self._load_metadata(pathlib.Path(meta_data_path))
 
     def layout(self, w: int, h: int) -> None:
         margin = 12
@@ -58,6 +65,15 @@ class CaptureUI:
                 "type": "capture",
             }
         )
+        self.buttons.append(
+            {
+                "x": margin + 180 + margin + 180 + margin,
+                "y": bottom_y,
+                "w": 220,
+                "h": action_btn_h,
+                "type": "save_to_drive",
+            }
+        )
 
     def draw(self, frame: np.ndarray) -> None:
         h, w = frame.shape[:2]
@@ -89,10 +105,16 @@ class CaptureUI:
                 text = self.class_names[idx]
             elif btype == "counter":
                 color = (50, 50, 50)
-                text = f"Instrument: {self.instance_id}"
-            else:
+                text = f"Instrument: {self.instance_counter}"
+            elif btype == "capture":
                 color = (0, 150, 0)
                 text = "Capture"
+            elif btype == "save_to_drive":
+                color = (0, 150, 0)
+                text = "Save to Drive"
+            else:
+                color = (50, 50, 50)
+                text = ""
 
             cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, -1)
             cv2.rectangle(frame, (x, y), (x + bw, y + bh), (255, 255, 255), 2)
@@ -127,28 +149,65 @@ class CaptureUI:
                     self.selected_idx = int(btn["idx"])
                     return "class"
                 if btype == "counter":
-                    self.instance_id += 1
-                    self.instance_image_id = 1
+                    self.instance_id = uuid.uuid4()
+                    self.instance_counter += 1
+                    self.capture_id = 0
                     return "counter"
                 if btype == "capture":
                     return "capture"
+                if btype == "save_to_drive":
+                    return "save_to_drive"
         return None
 
-    def save_frames(self, dark_frame: np.ndarray, bright_frame: np.ndarray) -> tuple[pathlib.Path, pathlib.Path]:
+    def save_frames(
+        self, dark_frame: np.ndarray, bright_frame: np.ndarray
+    ) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
         dark_path = self._save_frame(dark_frame, "dark")
         bright_path = self._save_frame(bright_frame, "bright")
-        self.instance_image_id += 1
+        self.capture_id += 1
         return dark_path, bright_path
 
-    def _save_frame(self, frame: np.ndarray, suffix: str | None = None) -> pathlib.Path:
+    def _save_frame(self, frame: np.ndarray, illumination: str) -> pathlib.Path:
         class_name = self.class_names[self.selected_idx]
-        stamp = time.strftime("%Y%m%d")
         class_dir = self.data_dir / class_name
         class_dir.mkdir(parents=True, exist_ok=True)
-        if suffix:
-            filename = f"{stamp}_inst{self.instance_id:04d}_img{self.instance_image_id:04d}_{suffix}.jpg"
-        else:
-            filename = f"{stamp}_inst{self.instance_id:04d}_img{self.instance_image_id:04d}.jpg"
+        frame_id = f"{self.capture_id}_{illumination}"
+        filename = f"{self.instance_id}_{frame_id}.jpg"
         out_path = class_dir / filename
         cv2.imwrite(str(out_path), frame)
+        self._save_metadata(frame, class_name, frame_id, illumination, out_path)
         return out_path
+
+    def _save_metadata(
+        self,
+        frame: np.ndarray,
+        class_name: str,
+        frame_id: str,
+        illumination: str,
+        path: pathlib.Path,
+    ) -> pathlib.Path:
+        utc_timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat() + "Z" 
+        class_dir = self.data_dir / class_name
+        sha256_hash = hashlib.sha256(frame.tobytes()).hexdigest()
+        meta_name = f"{self.instance_id}_{frame_id}_meta.json"
+        meta_path = class_dir / meta_name
+        payload = {
+            "frame_id": str(frame_id),
+            "capture_id": str(self.capture_id),
+            "instrument_id": str(self.instance_id),
+            "illumination": illumination,
+            "timestamp": utc_timestamp,
+            "file": path.name,
+            "width": frame.shape[1],
+            "height": frame.shape[0],
+            "sha256": sha256_hash,
+            "label" : {"class": class_name, "source": self.station_metadata.get("source", "unknown"), "review_status": "new"},
+            "station_id": self.station_metadata.get("station_id", "unknown"),
+        }
+        meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+    def _load_metadata(self, meta_path: pathlib.Path) -> dict:
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Metadata file not found: {meta_path}")
+        return json.loads(meta_path.read_text(encoding="utf-8"))

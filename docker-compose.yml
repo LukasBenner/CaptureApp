@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  captureapp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: captureapp:local
+    container_name: captureapp
+    restart: unless-stopped
+    user: root
+    privileged: true
+    runtime: nvidia
+    working_dir: /workspace/CaptureApp
+    command: ["python3", "-u", "/workspace/CaptureApp/main.py"]
+    devices:
+      - /dev/video0
+      - /dev/i2c-7
+      - /dev/gpiochip2
+      - /dev/spidev0.0
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      TZ: "Europe/Berlin"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+      DISPLAY: :0
+      GST_DEBUG: "2"
+      XDG_RUNTIME_DIR: /tmp
+      GST_INSTALL_DIR: /home/GX100_Application/gst-plugins
+      GST_PLUGIN_PATH: /home/GX100_Application/gst-plugins
+    volumes:
+      - /multireader-trigger:/multireader-trigger
+      - /home/aesculap/CaptureApp:/workspace/CaptureApp
+      - /home/aesculap/.ssh:/root/.ssh
+      - /data/lens:/data/lens
+      - /sys/class/hwmon/hwmon1/temp1_input:/sys/class/hwmon/hwmon1/temp1_input:ro
+      - /tmp/argus_socket:/tmp/argus_socket
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /tmp:/tmp
+      - /mnt/usb:/mnt/usb
+      - /dev:/dev

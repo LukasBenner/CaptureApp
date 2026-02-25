@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Simple camera viewer to test OpenCV CUDA GPU support."""
 
-import time
-
 import argparse
+import os
 import pathlib
+import subprocess
+import time
 
 import cv2
 import numpy as np
@@ -64,6 +65,11 @@ def main():
         "--data-dir",
         default=DATA_DIR,
         help="Directory to store captured images",
+    )
+    parser.add_argument(
+        "--meta-data-path",
+        default="station_metadata.json",
+        help="Path to station metadata JSON file",
     )
     parser.add_argument(
         "--lens-adjust-interval-s",
@@ -126,11 +132,13 @@ def main():
     cv2.resizeWindow(window_name, DISPLAY_W, DISPLAY_H)
 
     frame_toggle = 0
-    ui = CaptureUI(CLASS_NAMES, args.data_dir, DISPLAY_W)
+    ui = CaptureUI(CLASS_NAMES, args.data_dir, args.meta_data_path, DISPLAY_W)
     prev_frame: np.ndarray | None = None
     last_frame: np.ndarray | None = None
     last_saved_paths: list[pathlib.Path] | None = None
     last_saved_time = 0.0
+    rsync_status_lines: list[str] = []
+    last_rsync_time = 0.0
 
     print("Press ESC to exit. Click a class, increment instrument, then Capture.\n")
 
@@ -142,7 +150,7 @@ def main():
         return float(np.mean(gray))
 
     def on_mouse(event, x, y, _flags, _param):
-        nonlocal prev_frame, last_frame, last_saved_paths, last_saved_time
+        nonlocal prev_frame, last_frame, last_saved_paths, last_saved_time, rsync_status_lines, last_rsync_time
         if event == cv2.EVENT_LBUTTONDOWN:
             action = ui.handle_click(x, y)
             if action == "capture" and last_frame is not None and prev_frame is not None:
@@ -155,6 +163,23 @@ def main():
                 dark_path, bright_path = ui.save_frames(dark_frame, bright_frame)
                 last_saved_paths = [bright_path, dark_path]
                 last_saved_time = time.time()
+                
+            if action == "save_to_drive":
+                rsync_status_lines = []
+                ret = os.system(f"mount /dev/sda1 /mnt/usb")
+                if ret != 0:
+                    rsync_status_lines.append("Error mounting USB drive.")
+                    return
+                proc = subprocess.Popen(['rsync', '-av', f"{args.data_dir}/", "/mnt/usb/data_capture/"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                ret = proc.wait()
+                if ret != 0:
+                    rsync_status_lines.append("Error syncing files to USB drive.")
+                ret =os.system(f"umount /mnt/usb")
+                if ret != 0:
+                    rsync_status_lines.append("Error unmounting USB drive.")
+                    return
+                rsync_status_lines.append("Sync of files to USB drive completed.")
+                last_rsync_time = time.time()
 
     cv2.setMouseCallback(window_name, on_mouse)
 
@@ -171,11 +196,37 @@ def main():
                 continue
             ui.draw(frame)
 
+            # Draw rsync status lines in the bottom right, above the button bar
+            if rsync_status_lines and (time.time() - last_rsync_time) < 5.0:
+                button_bar_h = max(90, int(DISPLAY_H * 0.16))
+                for idx, line in enumerate(rsync_status_lines[-5:]):
+                    text_size, _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    text_width, text_height = text_size
+                    x = DISPLAY_W - text_width - 20
+                    y = DISPLAY_H - button_bar_h + 30 + idx * 28
+                    cv2.putText(
+                        frame,
+                        line,
+                        (x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+            # Draw last saved paths in the bottom right, above the button bar
             if last_saved_paths is not None and (time.time() - last_saved_time) < 1.5:
+                button_bar_h = max(90, int(DISPLAY_H * 0.16))
+                label = "Saved:"
+                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+                label_width, label_height = label_size
+                x = DISPLAY_W - label_width - 20
+                y = DISPLAY_H - button_bar_h + 30
                 cv2.putText(
                     frame,
-                    "Saved:",
-                    (20, 50),
+                    label,
+                    (x, y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.9,
                     (0, 255, 0),
@@ -183,10 +234,15 @@ def main():
                     cv2.LINE_AA,
                 )
                 for idx, path in enumerate(last_saved_paths):
+                    path_text = path.name
+                    path_size, _ = cv2.getTextSize(path_text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
+                    path_width, path_height = path_size
+                    px = DISPLAY_W - path_width - 20
+                    py = y + (idx + 1) * 28
                     cv2.putText(
                         frame,
-                        path.name,
-                        (20, 50 + (idx + 1) * 28),
+                        path_text,
+                        (px, py),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.75,
                         (0, 255, 0),
