@@ -110,7 +110,7 @@ def main():
     lens_controller.adjust_once()
     lens_controller.start()
 
-    delay = 2
+    delay = 1
     print(f"Waiting {delay} seconds for camera to initialize...")
     time.sleep(delay)
     
@@ -137,7 +137,8 @@ def main():
     last_frame: np.ndarray | None = None
     last_saved_paths: list[pathlib.Path] | None = None
     last_saved_time = 0.0
-    rsync_status_lines: list[str] = []
+    rsync_status_line: str = ""
+    rsync_error_line: str = ""
     last_rsync_time = 0.0
 
     print("Press ESC to exit. Click a class, increment instrument, then Capture.\n")
@@ -150,7 +151,7 @@ def main():
         return float(np.mean(gray))
 
     def on_mouse(event, x, y, _flags, _param):
-        nonlocal prev_frame, last_frame, last_saved_paths, last_saved_time, rsync_status_lines, last_rsync_time
+        nonlocal prev_frame, last_frame, last_saved_paths, last_saved_time, rsync_status_line, rsync_error_line, last_rsync_time
         if event == cv2.EVENT_LBUTTONDOWN:
             action = ui.handle_click(x, y)
             if action == "capture" and last_frame is not None and prev_frame is not None:
@@ -165,22 +166,24 @@ def main():
                 last_saved_time = time.time()
                 
             if action == "save_to_drive":
-                rsync_status_lines = []
-                ret = os.system(f"mount /dev/sda1 /mnt/usb")
-                if ret != 0:
-                    rsync_status_lines.append("Error mounting USB drive.")
+                rsync_status_line = ""
+                rsync_error_line = ""
+                last_rsync_time = time.time()
+                result = subprocess.run(['mount', '/dev/sda1', '/mnt/usb'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                if result.returncode != 0:
+                    rsync_error_line = result.stdout.decode('utf-8') if result.stdout else "Error mounting USB drive."
                     return
-                proc = subprocess.Popen(['rsync', '-av', f"{args.data_dir}/", "/mnt/usb/data_capture/"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                proc = subprocess.Popen(['rsync', '--remove-source-files', '-av', f"{args.data_dir}/", "/mnt/usb/data_capture/"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                 ret = proc.wait()
                 if ret != 0:
-                    rsync_status_lines.append("Error syncing files to USB drive.")
-                ret =os.system(f"umount /mnt/usb")
-                if ret != 0:
-                    rsync_status_lines.append("Error unmounting USB drive.")
+                    rsync_error_line = "Error syncing files to USB drive."
+                else:
+                    rsync_status_line = "Sync of files to USB drive completed."
+                result = subprocess.run(['umount', '/mnt/usb'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                if result.returncode != 0:
+                    rsync_error_line = result.stdout.decode('utf-8') if result.stdout else "Error unmounting USB drive."
                     return
-                rsync_status_lines.append("Sync of files to USB drive completed.")
-                last_rsync_time = time.time()
-
+                
     cv2.setMouseCallback(window_name, on_mouse)
 
     try:
@@ -197,29 +200,45 @@ def main():
             ui.draw(frame)
 
             # Draw rsync status lines in the bottom right, above the button bar
-            if rsync_status_lines and (time.time() - last_rsync_time) < 5.0:
+            if rsync_status_line and (time.time() - last_rsync_time) < 1.5:
                 button_bar_h = max(90, int(DISPLAY_H * 0.16))
-                for idx, line in enumerate(rsync_status_lines[-5:]):
-                    text_size, _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    text_width, text_height = text_size
-                    x = DISPLAY_W - text_width - 20
-                    y = DISPLAY_H - button_bar_h + 30 + idx * 28
-                    cv2.putText(
-                        frame,
-                        line,
-                        (x, y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
+                text_size, _ = cv2.getTextSize(rsync_status_line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                text_width, text_height = text_size
+                x = DISPLAY_W - text_width - 20
+                y = DISPLAY_H - button_bar_h + 30
+                cv2.putText(
+                    frame,
+                    rsync_status_line,
+                    (x, y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+            # Draw rsync error lines in the bottom right, above the button bar
+            if rsync_error_line and (time.time() - last_rsync_time) < 3.0:
+                button_bar_h = max(90, int(DISPLAY_H * 0.16))
+                text_size, _ = cv2.getTextSize(rsync_error_line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                text_width, text_height = text_size
+                x = DISPLAY_W - text_width - 20
+                y = DISPLAY_H - button_bar_h + 30
+                cv2.putText(
+                    frame,
+                    rsync_error_line,
+                    (x, y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             # Draw last saved paths in the bottom right, above the button bar
             if last_saved_paths is not None and (time.time() - last_saved_time) < 1.5:
                 button_bar_h = max(90, int(DISPLAY_H * 0.16))
                 label = "Saved:"
-                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                 label_width, label_height = label_size
                 x = DISPLAY_W - label_width - 20
                 y = DISPLAY_H - button_bar_h + 30
@@ -228,14 +247,14 @@ def main():
                     label,
                     (x, y),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
+                    0.6,
                     (0, 255, 0),
                     2,
                     cv2.LINE_AA,
                 )
                 for idx, path in enumerate(last_saved_paths):
                     path_text = path.name
-                    path_size, _ = cv2.getTextSize(path_text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
+                    path_size, _ = cv2.getTextSize(path_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                     path_width, path_height = path_size
                     px = DISPLAY_W - path_width - 20
                     py = y + (idx + 1) * 28
@@ -244,7 +263,7 @@ def main():
                         path_text,
                         (px, py),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.75,
+                        0.6,
                         (0, 255, 0),
                         2,
                         cv2.LINE_AA,
