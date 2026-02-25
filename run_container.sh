@@ -16,11 +16,11 @@ v4l2-ctl -c trigger_mode=1
 v4l2-ctl -c gain=0
 
 if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
-  echo "Container is already running → connecting..."
-  docker compose -f "$COMPOSE_FILE" exec "$SERVICE" /bin/bash
+  echo "Container is already running → restarting..."
+  docker compose -f "$COMPOSE_FILE" down
+  docker compose -f "$COMPOSE_FILE" up -d
   exit
 fi
 
 echo "Container is not running → Starting..."
 docker compose -f "$COMPOSE_FILE" up -d
-docker compose -f "$COMPOSE_FILE" exec "$SERVICE" /bin/bash
