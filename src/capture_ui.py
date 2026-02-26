@@ -1,12 +1,13 @@
+# capture_ui.py
 import datetime
+import hashlib
 import json
 import pathlib
 import time
+import uuid
 
 import cv2
 import numpy as np
-import uuid
-import hashlib
 
 
 class CaptureUI:
@@ -159,9 +160,7 @@ class CaptureUI:
                     return "save_to_drive"
         return None
 
-    def save_frames(
-        self, dark_frame: np.ndarray, bright_frame: np.ndarray
-    ) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    def save_frames(self, dark_frame: np.ndarray, bright_frame: np.ndarray) -> tuple[pathlib.Path, pathlib.Path]:
         dark_path = self._save_frame(dark_frame, "dark")
         bright_path = self._save_frame(bright_frame, "bright")
         self.capture_id += 1
@@ -186,7 +185,7 @@ class CaptureUI:
         illumination: str,
         path: pathlib.Path,
     ) -> pathlib.Path:
-        utc_timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat() + "Z" 
+        utc_timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat() + "Z"
         class_dir = self.data_dir / class_name
         sha256_hash = hashlib.sha256(frame.tobytes()).hexdigest()
         meta_name = f"{self.instance_id}_{frame_id}_meta.json"
@@ -201,13 +200,129 @@ class CaptureUI:
             "width": frame.shape[1],
             "height": frame.shape[0],
             "sha256": sha256_hash,
-            "label" : {"class": class_name, "source": self.station_metadata.get("source", "unknown"), "review_status": "new"},
+            "label": {
+                "class": class_name,
+                "source": self.station_metadata.get("source", "unknown"),
+                "review_status": "new",
+            },
             "station_id": self.station_metadata.get("station_id", "unknown"),
         }
         meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
+        return meta_path
 
     def _load_metadata(self, meta_path: pathlib.Path) -> dict:
         if not meta_path.exists():
             raise FileNotFoundError(f"Metadata file not found: {meta_path}")
         return json.loads(meta_path.read_text(encoding="utf-8"))
+
+    # ----------------------------
+    # Copy progress overlay
+    # ----------------------------
+    def draw_copy_overlay(self, frame: np.ndarray, progress) -> None:
+        """
+        Draw a centered overlay when copying is running, and a short toast when done/error.
+
+        Expects an object with fields similar to:
+          running, ok, phase, message, error,
+          total_bytes, copied_bytes, total_files, copied_files,
+          current_file, toast_until
+        """
+        now = time.time()
+        show_toast = getattr(progress, "toast_until", 0.0) > now
+        show_full = getattr(progress, "running", False)
+
+        if not show_full and not show_toast:
+            return
+
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+
+        # Center box
+        box_w = int(w * 0.62)
+        box_h = int(h * 0.22)
+        x0 = (w - box_w) // 2
+        y0 = (h - box_h) // 2
+        x1 = x0 + box_w
+        y1 = y0 + box_h
+
+        # Dim background a bit
+        cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+
+        # Box background
+        box = frame.copy()
+        cv2.rectangle(box, (x0, y0), (x1, y1), (20, 20, 20), -1)
+        cv2.addWeighted(box, 0.75, frame, 0.25, 0, frame)
+
+        # Border
+        cv2.rectangle(frame, (x0, y0), (x1, y1), (255, 255, 255), 2)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # Title
+        if getattr(progress, "running", False):
+            title = "Saving to USB…"
+        else:
+            title = "Finished" if getattr(progress, "ok", False) and not getattr(progress, "error", "") else "Error"
+
+        cv2.putText(frame, title, (x0 + 18, y0 + 40), font, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+        phase = getattr(progress, "phase", "")
+        msg = getattr(progress, "message", "")
+        err = getattr(progress, "error", "")
+
+        if err:
+            err_short = err.strip().replace("\n", " ")
+            if len(err_short) > 90:
+                err_short = err_short[:90] + "…"
+            cv2.putText(frame, err_short, (x0 + 18, y0 + 75), font, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+        else:
+            line = f"{phase}: {msg}".strip(": ")
+            cv2.putText(frame, line, (x0 + 18, y0 + 75), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+        total_b = int(getattr(progress, "total_bytes", 0) or 0)
+        done_b = int(getattr(progress, "copied_bytes", 0) or 0)
+        total_f = int(getattr(progress, "total_files", 0) or 0)
+        done_f = int(getattr(progress, "copied_files", 0) or 0)
+
+        ratio = (done_b / total_b) if total_b > 0 else (done_f / total_f if total_f > 0 else 0.0)
+        ratio = max(0.0, min(1.0, ratio))
+
+        cur = getattr(progress, "current_file", "")
+        if cur:
+            cur_short = cur.replace("\n", " ")
+            if len(cur_short) > 70:
+                cur_short = "…" + cur_short[-69:]
+            cv2.putText(frame, f"File: {cur_short}", (x0 + 18, y0 + 105), font, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+        def fmt_bytes(n: int) -> str:
+            n_f = float(n)
+            for unit in ["B", "KB", "MB", "GB", "TB"]:
+                if n_f < 1024:
+                    return f"{n_f:.0f}{unit}" if unit == "B" else f"{n_f:.1f}{unit}"
+                n_f /= 1024
+            return f"{n_f:.1f}PB"
+
+        if total_b > 0:
+            p_line = f"{int(ratio * 100)}%  ({fmt_bytes(done_b)} / {fmt_bytes(total_b)})   Files: {done_f}/{total_f}"
+        else:
+            p_line = f"{int(ratio * 100)}%   Files: {done_f}/{total_f}"
+
+        cv2.putText(frame, p_line, (x0 + 18, y0 + 135), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # Progress bar
+        bar_x0 = x0 + 18
+        bar_y0 = y0 + box_h - 42
+        bar_x1 = x1 - 18
+        bar_y1 = bar_y0 + 18
+
+        cv2.rectangle(frame, (bar_x0, bar_y0), (bar_x1, bar_y1), (255, 255, 255), 2)
+        fill_w = int((bar_x1 - bar_x0 - 4) * ratio)
+        if fill_w > 0:
+            cv2.rectangle(
+                frame,
+                (bar_x0 + 2, bar_y0 + 2),
+                (bar_x0 + 2 + fill_w, bar_y1 - 2),
+                (0, 200, 255),
+                -1,
+            )

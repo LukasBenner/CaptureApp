@@ -1,11 +1,13 @@
-#!/usr/bin/env python3
-"""Simple camera viewer to test OpenCV CUDA GPU support."""
-
+# main.py
 import argparse
 import os
 import pathlib
+import re
 import subprocess
+import threading
 import time
+from dataclasses import dataclass
+from typing import Optional, Callable
 
 import cv2
 import numpy as np
@@ -32,7 +34,7 @@ CLASS_NAMES = [
     "ok",
     "other",
     "silicate_stain",
-    "water_stain"
+    "water_stain",
 ]
 
 
@@ -40,12 +42,12 @@ CLASS_NAMES = [
 # Camera pipeline
 # ----------------------------
 def gstreamer_pipeline(
-        sensor_id: int = 0,
-        sensor_mode: int = 1,
-        capture_width: int = 2464,
-        capture_height: int = 2064,
-        flip_method: int = 2,
-        framerate: int = 60
+    sensor_id: int = 0,
+    sensor_mode: int = 1,
+    capture_width: int = 2464,
+    capture_height: int = 2064,
+    flip_method: int = 2,
+    framerate: int = 60,
 ) -> str:
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} sensor-mode={sensor_mode} aelock=true awblock=false wbmode=2 tnr-mode=0 tnr-strength=-1 ee-mode=2 ee-strength=0 saturation=0.75 gainrange=\"1 1\" ispdigitalgainrange=\"1 1\" "
@@ -55,6 +57,333 @@ def gstreamer_pipeline(
         "! queue max-size-buffers=1 leaky=downstream "
         "! appsink drop=1 max-buffers=1 sync=false"
     )
+
+
+# ----------------------------
+# Async USB copy support
+# ----------------------------
+@dataclass
+class CopyProgress:
+    running: bool = False
+    done: bool = False
+    ok: bool = False
+
+    phase: str = ""       # mounting/scanning/copying/unmounting/finished/error
+    message: str = ""
+    error: str = ""
+
+    total_bytes: int = 0
+    copied_bytes: int = 0
+    total_files: int = 0
+    copied_files: int = 0
+
+    current_file: str = ""
+
+    started_at: float = 0.0
+    finished_at: float = 0.0
+
+    # show a "toast" overlay after completion/error
+    toast_until: float = 0.0
+
+
+def reset_progress(p: CopyProgress) -> None:
+    p.running = False
+    p.done = False
+    p.ok = False
+    p.phase = ""
+    p.message = ""
+    p.error = ""
+    p.total_bytes = 0
+    p.copied_bytes = 0
+    p.total_files = 0
+    p.copied_files = 0
+    p.current_file = ""
+    p.started_at = 0.0
+    p.finished_at = 0.0
+    p.toast_until = 0.0
+
+
+def _read_text(path: pathlib.Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def _is_mounted(mount_point: str) -> bool:
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == mount_point:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _ensure_dir(p: pathlib.Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _iter_files(root: pathlib.Path) -> list[pathlib.Path]:
+    if not root.exists():
+        return []
+    return [p for p in root.rglob("*") if p.is_file()]
+
+
+def _safe_remove_empty_dirs(root: pathlib.Path) -> None:
+    if not root.exists():
+        return
+    dirs = sorted(
+        [p for p in root.rglob("*") if p.is_dir()],
+        key=lambda x: len(str(x)),
+        reverse=True,
+    )
+    for d in dirs:
+        try:
+            next(d.iterdir())
+        except StopIteration:
+            try:
+                d.rmdir()
+            except Exception:
+                pass
+
+
+def _copy_file_chunked(
+    src: pathlib.Path,
+    dst: pathlib.Path,
+    chunk_size: int,
+    on_bytes: Callable[[int], None],
+) -> None:
+    _ensure_dir(dst.parent)
+    tmp = dst.with_suffix(dst.suffix + ".part")
+
+    with open(src, "rb") as fsrc, open(tmp, "wb") as fdst:
+        while True:
+            buf = fsrc.read(chunk_size)
+            if not buf:
+                break
+            fdst.write(buf)
+            on_bytes(len(buf))
+        fdst.flush()
+        os.fsync(fdst.fileno())
+
+    os.replace(tmp, dst)
+
+    # Preserve timestamps if possible
+    try:
+        st = src.stat()
+        os.utime(dst, (st.st_atime, st.st_mtime))
+    except Exception:
+        pass
+
+
+def copy_tree_to_usb(
+    src_root: pathlib.Path,
+    dst_root: pathlib.Path,
+    progress: CopyProgress,
+    remove_source_files: bool = True,
+    chunk_size: int = 1024 * 1024,  # 1 MiB
+) -> None:
+    progress.phase = "scanning"
+    progress.message = "Scanning files…"
+
+    files = _iter_files(src_root)
+    progress.total_files = len(files)
+    progress.total_bytes = 0
+    progress.copied_files = 0
+    progress.copied_bytes = 0
+
+    for p in files:
+        try:
+            progress.total_bytes += p.stat().st_size
+        except Exception:
+            pass
+
+    if progress.total_files == 0:
+        progress.phase = "finished"
+        progress.message = "No files to copy."
+        progress.ok = True
+        return
+
+    progress.phase = "copying"
+    progress.message = "Copying…"
+
+    def on_bytes(n: int) -> None:
+        progress.copied_bytes += n
+
+    for src in files:
+        rel = src.relative_to(src_root)
+        dst = dst_root / rel
+
+        progress.current_file = str(rel)
+
+        _copy_file_chunked(src, dst, chunk_size=chunk_size, on_bytes=on_bytes)
+        progress.copied_files += 1
+
+        if remove_source_files:
+            try:
+                src.unlink()
+            except Exception:
+                # Keep going, but report last such issue
+                progress.error = f"Could not remove source file: {src}"
+
+    if remove_source_files:
+        _safe_remove_empty_dirs(src_root)
+
+    progress.phase = "finished"
+    progress.message = "Copy finished."
+    progress.ok = True
+
+
+def _list_candidate_usb_partitions() -> list[str]:
+    """
+    Return a list of /dev/<partition> paths that look like removable USB partitions.
+    Uses /sys/class/block and checks parent disk removable == 1.
+    """
+    sys_block = pathlib.Path("/sys/class/block")
+    if not sys_block.exists():
+        return []
+
+    candidates: list[str] = []
+
+    for dev in sys_block.iterdir():
+        name = dev.name
+
+        # Skip obvious non-USB block devices
+        if name.startswith(("loop", "ram", "mmcblk", "nvme")):
+            continue
+
+        # Only partitions
+        if not (dev / "partition").exists():
+            continue
+
+        # Most common case: sda1, sdb2, ...
+        m = re.match(r"^(sd[a-z]+)(\d+)$", name)
+        if not m:
+            continue
+
+        parent = m.group(1)
+        parent_path = sys_block / parent
+        if not parent_path.exists():
+            continue
+
+        removable = _read_text(parent_path / "removable")
+        if removable != "1":
+            continue
+
+        candidates.append(f"/dev/{name}")
+
+    return candidates
+
+
+def _has_filesystem(dev_path: str) -> bool:
+    """
+    If blkid exists, prefer partitions with detectable filesystem.
+    If blkid isn't present, return True and let mount attempt decide.
+    """
+    try:
+        r = subprocess.run(
+            ["blkid", "-o", "value", "-s", "TYPE", dev_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if r.returncode != 0:
+            return False
+        fs = (r.stdout.decode("utf-8", errors="replace") or "").strip()
+        return bool(fs)
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+
+
+def find_usb_partition() -> str:
+    cands = _list_candidate_usb_partitions()
+    if not cands:
+        raise RuntimeError("No USB storage partition detected. Please insert a USB stick.")
+    with_fs = [d for d in cands if _has_filesystem(d)]
+    return with_fs[0] if with_fs else cands[0]
+
+
+def start_async_copy_job(
+    progress: CopyProgress,
+    device: str,
+    mount_point: pathlib.Path,
+    src_root: pathlib.Path,
+    dst_root: pathlib.Path,
+) -> threading.Thread:
+    def worker():
+        progress.running = True
+        progress.done = False
+        progress.ok = False
+        progress.error = ""
+        progress.message = ""
+        progress.current_file = ""
+        progress.phase = "mounting"
+        progress.started_at = time.time()
+
+        _ensure_dir(mount_point)
+
+        mounted_by_us = False
+        try:
+            if _is_mounted(str(mount_point)):
+                progress.message = "USB already mounted."
+            else:
+                progress.message = f"Mounting {device}…"
+                r = subprocess.run(
+                    ["mount", device, str(mount_point)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+                if r.returncode != 0:
+                    out = (r.stdout.decode("utf-8", errors="replace") if r.stdout else "").strip()
+                    raise RuntimeError(out or "Error mounting USB drive.")
+                mounted_by_us = True
+
+            copy_tree_to_usb(src_root=src_root, dst_root=dst_root, progress=progress)
+
+        except Exception as e:
+            progress.error = str(e)
+            progress.ok = False
+            progress.phase = "error"
+
+        finally:
+            if mounted_by_us:
+                progress.phase = "unmounting"
+                progress.message = "Unmounting…"
+                try:
+                    r = subprocess.run(
+                        ["umount", str(mount_point)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+                    if r.returncode != 0 and not progress.error:
+                        out = (r.stdout.decode("utf-8", errors="replace") if r.stdout else "").strip()
+                        progress.error = out or "Error unmounting USB drive."
+                        progress.ok = False
+                        progress.phase = "error"
+                except Exception as e:
+                    if not progress.error:
+                        progress.error = str(e)
+                    progress.ok = False
+                    progress.phase = "error"
+
+            progress.running = False
+            progress.done = True
+            progress.finished_at = time.time()
+            progress.toast_until = time.time() + 2.5
+
+            if not progress.error:
+                progress.ok = True
+                progress.phase = "finished"
+                progress.message = "Copy to USB completed."
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return t
+
 
 # ----------------------------
 # Main
@@ -113,9 +442,13 @@ def main():
     delay = 1
     print(f"Waiting {delay} seconds for camera to initialize...")
     time.sleep(delay)
-    
+
     cap = None
-    pipeline = gstreamer_pipeline(capture_width=CAPTURE_W, capture_height=CAPTURE_H, framerate=CAPTURE_FPS)
+    pipeline = gstreamer_pipeline(
+        capture_width=CAPTURE_W,
+        capture_height=CAPTURE_H,
+        framerate=CAPTURE_FPS,
+    )
     try:
         candidate = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
         if candidate.isOpened():
@@ -137,9 +470,9 @@ def main():
     last_frame: np.ndarray | None = None
     last_saved_paths: list[pathlib.Path] | None = None
     last_saved_time = 0.0
-    rsync_status_line: str = ""
-    rsync_error_line: str = ""
-    last_rsync_time = 0.0
+
+    copy_progress = CopyProgress()
+    copy_thread: Optional[threading.Thread] = None
 
     print("Press ESC to exit. Click a class, increment instrument, then Capture.\n")
 
@@ -151,9 +484,10 @@ def main():
         return float(np.mean(gray))
 
     def on_mouse(event, x, y, _flags, _param):
-        nonlocal prev_frame, last_frame, last_saved_paths, last_saved_time, rsync_status_line, rsync_error_line, last_rsync_time
+        nonlocal prev_frame, last_frame, last_saved_paths, last_saved_time, copy_progress, copy_thread
         if event == cv2.EVENT_LBUTTONDOWN:
             action = ui.handle_click(x, y)
+
             if action == "capture" and last_frame is not None and prev_frame is not None:
                 last_luma = frame_luma_mean(last_frame)
                 prev_luma = frame_luma_mean(prev_frame)
@@ -164,38 +498,37 @@ def main():
                 dark_path, bright_path = ui.save_frames(dark_frame, bright_frame)
                 last_saved_paths = [bright_path, dark_path]
                 last_saved_time = time.time()
-                
+
             if action == "save_to_drive":
-                rsync_status_line = ""
-                rsync_error_line = ""
-                last_rsync_time = time.time()
+                # Prevent overlapping copy jobs
+                if copy_progress.running:
+                    copy_progress.toast_until = time.time() + 1.5
+                    copy_progress.message = "Copy already in progress…"
+                    return
+
+                reset_progress(copy_progress)
+
+                # Detect the inserted USB partition dynamically
                 try:
-                    result = subprocess.run(['mount', '/dev/sda1', '/mnt/usb'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    if result.returncode != 0:
-                        rsync_error_line = result.stdout.decode('utf-8') if result.stdout else "Error mounting USB drive."
-                        print(f"Mount error: {rsync_error_line}")
-                        raise RuntimeError(rsync_error_line)
-
-                    proc = subprocess.Popen(['rsync', '--remove-source-files', '-az', f"{args.data_dir}/", "/mnt/usb/data_capture/"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    ret = proc.wait()
-                    output = proc.stdout.read().decode('utf-8') if proc.stdout else ""
-                    if ret != 0:
-                        rsync_error_line = f"Error syncing files to USB drive. Output: {output}"
-                        print(f"Rsync error: {rsync_error_line}")
-                        raise RuntimeError(rsync_error_line)
-                    else:
-                        rsync_status_line = "Sync of files to USB drive completed."
-
+                    device = find_usb_partition()
                 except Exception as e:
-                    rsync_error_line = str(e)
-                finally:
-                    result = subprocess.run(['umount', '/mnt/usb'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    if result.returncode != 0:
-                        unmount_error = result.stdout.decode('utf-8') if result.stdout else "Error unmounting USB drive."
-                        print(f"Unmount error: {unmount_error}")
-                        rsync_error_line = unmount_error
-                        # Do not raise here, just report
-                
+                    copy_progress.error = str(e)
+                    copy_progress.phase = "error"
+                    copy_progress.toast_until = time.time() + 2.5
+                    return
+
+                mount_point = pathlib.Path("/mnt/usb")
+                src_root = pathlib.Path(args.data_dir)
+                dst_root = mount_point / "data_capture"
+
+                copy_thread = start_async_copy_job(
+                    progress=copy_progress,
+                    device=device,
+                    mount_point=mount_point,
+                    src_root=src_root,
+                    dst_root=dst_root,
+                )
+
     cv2.setMouseCallback(window_name, on_mouse)
 
     try:
@@ -204,54 +537,24 @@ def main():
             if not ok:
                 print("Failed to read frame")
                 break
+
             frame_toggle = (frame_toggle + 1) % 2
             prev_frame = last_frame
             last_frame = frame.copy()
             if frame_toggle == 0:
                 continue
+
             ui.draw(frame)
 
-            # Draw rsync status lines in the bottom right, above the button bar
-            if rsync_status_line and (time.time() - last_rsync_time) < 1.5:
-                button_bar_h = max(90, int(DISPLAY_H * 0.16))
-                text_size, _ = cv2.getTextSize(rsync_status_line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                text_width, text_height = text_size
-                x = DISPLAY_W - text_width - 20
-                y = DISPLAY_H - button_bar_h + 30
-                cv2.putText(
-                    frame,
-                    rsync_status_line,
-                    (x, y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-            # Draw rsync error lines in the bottom right, above the button bar
-            if rsync_error_line and (time.time() - last_rsync_time) < 3.0:
-                button_bar_h = max(90, int(DISPLAY_H * 0.16))
-                text_size, _ = cv2.getTextSize(rsync_error_line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                text_width, text_height = text_size
-                x = DISPLAY_W - text_width - 20
-                y = DISPLAY_H - button_bar_h + 30
-                cv2.putText(
-                    frame,
-                    rsync_error_line,
-                    (x, y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
+            # Center overlay for copy progress/errors/finished toast
+            ui.draw_copy_overlay(frame, copy_progress)
 
             # Draw last saved paths in the bottom right, above the button bar
             if last_saved_paths is not None and (time.time() - last_saved_time) < 1.5:
                 button_bar_h = max(90, int(DISPLAY_H * 0.16))
                 label = "Saved:"
                 label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                label_width, label_height = label_size
+                label_width, _ = label_size
                 x = DISPLAY_W - label_width - 20
                 y = DISPLAY_H - button_bar_h + 30
                 cv2.putText(
@@ -267,7 +570,7 @@ def main():
                 for idx, path in enumerate(last_saved_paths):
                     path_text = path.name
                     path_size, _ = cv2.getTextSize(path_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    path_width, path_height = path_size
+                    path_width, _ = path_size
                     px = DISPLAY_W - path_width - 20
                     py = y + (idx + 1) * 28
                     cv2.putText(
@@ -284,8 +587,7 @@ def main():
             cv2.imshow(window_name, frame)
 
             key = cv2.waitKey(1) & 0xFF
-            # Exit on ESC
-            if key == 27:
+            if key == 27:  # ESC
                 break
 
     finally:
