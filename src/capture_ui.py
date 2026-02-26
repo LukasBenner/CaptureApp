@@ -1,4 +1,6 @@
 # capture_ui.py
+import concurrent.futures
+import contextlib
 import datetime
 import hashlib
 import json
@@ -8,6 +10,15 @@ import uuid
 
 import cv2
 import numpy as np
+
+
+def _fmt_bytes(n: int) -> str:
+    n_f = float(n)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if n_f < 1024:
+            return f"{n_f:.0f}{unit}" if unit == "B" else f"{n_f:.1f}{unit}"
+        n_f /= 1024
+    return f"{n_f:.1f}PB"
 
 
 class CaptureUI:
@@ -21,6 +32,7 @@ class CaptureUI:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.display_w = display_w
         self.buttons: list[dict[str, int | str]] = []
+        self._scratch = None  # reusable overlay buffer (np.ndarray once allocated)
 
         self.station_metadata = self._load_metadata(pathlib.Path(meta_data_path))
 
@@ -83,10 +95,12 @@ class CaptureUI:
 
         top_bar_h = max(70, int(h * 0.12))
         bottom_bar_h = max(90, int(h * 0.16))
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (w, top_bar_h), (10, 10, 10), -1)
-        cv2.rectangle(overlay, (0, h - bottom_bar_h), (w, h), (10, 10, 10), -1)
-        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+        if self._scratch is None or self._scratch.shape != frame.shape:
+            self._scratch = np.empty_like(frame)
+        np.copyto(self._scratch, frame)
+        cv2.rectangle(self._scratch, (0, 0), (w, top_bar_h), (10, 10, 10), -1)
+        cv2.rectangle(self._scratch, (0, h - bottom_bar_h), (w, h), (10, 10, 10), -1)
+        cv2.addWeighted(self._scratch, 0.65, frame, 0.35, 0, frame)
 
         for btn in self.buttons:
             x = int(btn["x"])
@@ -160,22 +174,33 @@ class CaptureUI:
                     return "save_to_drive"
         return None
 
-    def save_frames(self, dark_frame: np.ndarray, bright_frame: np.ndarray) -> tuple[pathlib.Path, pathlib.Path]:
-        dark_path = self._save_frame(dark_frame, "dark")
-        bright_path = self._save_frame(bright_frame, "bright")
-        self.capture_id += 1
-        return dark_path, bright_path
-
-    def _save_frame(self, frame: np.ndarray, illumination: str) -> pathlib.Path:
+    def save_frames_async(
+        self,
+        dark_frame: np.ndarray,
+        bright_frame: np.ndarray,
+        executor: concurrent.futures.Executor,
+    ) -> tuple[pathlib.Path, pathlib.Path]:
+        """Return paths immediately and perform disk I/O on the executor thread."""
         class_name = self.class_names[self.selected_idx]
         class_dir = self.data_dir / class_name
-        class_dir.mkdir(parents=True, exist_ok=True)
-        frame_id = f"{self.capture_id}_{illumination}"
-        filename = f"{self.instance_id}_{frame_id}.jpg"
-        out_path = class_dir / filename
-        cv2.imwrite(str(out_path), frame)
-        self._save_metadata(frame, class_name, frame_id, illumination, out_path)
-        return out_path
+        capture_id = self.capture_id
+        instance_id = self.instance_id
+        self.capture_id += 1
+
+        dark_frame_id = f"{capture_id}_dark"
+        bright_frame_id = f"{capture_id}_bright"
+        dark_path = class_dir / f"{instance_id}_{dark_frame_id}.jpg"
+        bright_path = class_dir / f"{instance_id}_{bright_frame_id}.jpg"
+
+        def _do_io() -> None:
+            class_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(dark_path), dark_frame)
+            self._save_metadata(dark_frame, class_name, dark_frame_id, "dark", dark_path)
+            cv2.imwrite(str(bright_path), bright_frame)
+            self._save_metadata(bright_frame, class_name, bright_frame_id, "bright", bright_path)
+
+        executor.submit(_do_io)
+        return dark_path, bright_path
 
     def _save_metadata(
         self,
@@ -227,15 +252,31 @@ class CaptureUI:
           total_bytes, copied_bytes, total_files, copied_files,
           current_file, toast_until
         """
+        # Take an atomic snapshot of all progress fields before rendering
+        lock = getattr(progress, "lock", None)
+        with (lock if lock is not None else contextlib.nullcontext()):
+            running = bool(getattr(progress, "running", False))
+            ok = bool(getattr(progress, "ok", False))
+            phase = str(getattr(progress, "phase", ""))
+            msg = str(getattr(progress, "message", ""))
+            err = str(getattr(progress, "error", ""))
+            total_b = int(getattr(progress, "total_bytes", 0) or 0)
+            done_b = int(getattr(progress, "copied_bytes", 0) or 0)
+            total_f = int(getattr(progress, "total_files", 0) or 0)
+            done_f = int(getattr(progress, "copied_files", 0) or 0)
+            cur = str(getattr(progress, "current_file", ""))
+            toast_until = float(getattr(progress, "toast_until", 0.0))
+
         now = time.time()
-        show_toast = getattr(progress, "toast_until", 0.0) > now
-        show_full = getattr(progress, "running", False)
+        show_toast = toast_until > now
+        show_full = running
 
         if not show_full and not show_toast:
             return
 
         h, w = frame.shape[:2]
-        overlay = frame.copy()
+        if self._scratch is None or self._scratch.shape != frame.shape:
+            self._scratch = np.empty_like(frame)
 
         # Center box
         box_w = int(w * 0.62)
@@ -245,14 +286,14 @@ class CaptureUI:
         x1 = x0 + box_w
         y1 = y0 + box_h
 
-        # Dim background a bit
-        cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+        # Dim background — copy frame into scratch, fill with black, blend back
+        np.copyto(self._scratch, frame)
+        cv2.rectangle(self._scratch, (0, 0), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(self._scratch, 0.25, frame, 0.75, 0, frame)
 
-        # Box background
-        box = frame.copy()
-        cv2.rectangle(box, (x0, y0), (x1, y1), (20, 20, 20), -1)
-        cv2.addWeighted(box, 0.75, frame, 0.25, 0, frame)
+        # Box background — reuse scratch (still all-black), fill box region and blend in-place
+        self._scratch[y0:y1, x0:x1] = (20, 20, 20)
+        cv2.addWeighted(self._scratch[y0:y1, x0:x1], 0.75, frame[y0:y1, x0:x1], 0.25, 0, frame[y0:y1, x0:x1])
 
         # Border
         cv2.rectangle(frame, (x0, y0), (x1, y1), (255, 255, 255), 2)
@@ -260,16 +301,12 @@ class CaptureUI:
         font = cv2.FONT_HERSHEY_SIMPLEX
 
         # Title
-        if getattr(progress, "running", False):
+        if running:
             title = "Saving to USB…"
         else:
-            title = "Finished" if getattr(progress, "ok", False) and not getattr(progress, "error", "") else "Error"
+            title = "Finished" if ok and not err else "Error"
 
         cv2.putText(frame, title, (x0 + 18, y0 + 40), font, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-
-        phase = getattr(progress, "phase", "")
-        msg = getattr(progress, "message", "")
-        err = getattr(progress, "error", "")
 
         if err:
             err_short = err.strip().replace("\n", " ")
@@ -280,31 +317,17 @@ class CaptureUI:
             line = f"{phase}: {msg}".strip(": ")
             cv2.putText(frame, line, (x0 + 18, y0 + 75), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
-        total_b = int(getattr(progress, "total_bytes", 0) or 0)
-        done_b = int(getattr(progress, "copied_bytes", 0) or 0)
-        total_f = int(getattr(progress, "total_files", 0) or 0)
-        done_f = int(getattr(progress, "copied_files", 0) or 0)
-
         ratio = (done_b / total_b) if total_b > 0 else (done_f / total_f if total_f > 0 else 0.0)
         ratio = max(0.0, min(1.0, ratio))
 
-        cur = getattr(progress, "current_file", "")
         if cur:
             cur_short = cur.replace("\n", " ")
             if len(cur_short) > 70:
                 cur_short = "…" + cur_short[-69:]
             cv2.putText(frame, f"File: {cur_short}", (x0 + 18, y0 + 105), font, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
-        def fmt_bytes(n: int) -> str:
-            n_f = float(n)
-            for unit in ["B", "KB", "MB", "GB", "TB"]:
-                if n_f < 1024:
-                    return f"{n_f:.0f}{unit}" if unit == "B" else f"{n_f:.1f}{unit}"
-                n_f /= 1024
-            return f"{n_f:.1f}PB"
-
         if total_b > 0:
-            p_line = f"{int(ratio * 100)}%  ({fmt_bytes(done_b)} / {fmt_bytes(total_b)})   Files: {done_f}/{total_f}"
+            p_line = f"{int(ratio * 100)}%  ({_fmt_bytes(done_b)} / {_fmt_bytes(total_b)})   Files: {done_f}/{total_f}"
         else:
             p_line = f"{int(ratio * 100)}%   Files: {done_f}/{total_f}"
 

@@ -6,8 +6,8 @@ from smbus2 import SMBus, i2c_msg
 
 class Lightning:
     def __init__(self) -> None:
-        subprocess.Popen(["gpioset", "gpiochip2", "19=1"])
-        subprocess.Popen(["gpioset", "gpiochip2", "16=1"])
+        subprocess.run(["gpioset", "gpiochip2", "19=1"], check=True)
+        subprocess.run(["gpioset", "gpiochip2", "16=1"], check=True)
         self.bus_number = 7
         self.device_address = 0x12
         self.LED_array = [
@@ -31,8 +31,8 @@ class Lightning:
                 bus.i2c_rdwr(write)
 
     def stop(self) -> None:
-        subprocess.Popen(["gpioset", "gpiochip2", "19=0"])
-        subprocess.Popen(["gpioset", "gpiochip2", "16=0"])
+        subprocess.run(["gpioset", "gpiochip2", "19=0"], check=True)
+        subprocess.run(["gpioset", "gpiochip2", "16=0"], check=True)
 
     def update(self) -> None:
         pass

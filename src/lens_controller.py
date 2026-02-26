@@ -48,7 +48,7 @@ class LensController(Thread):
             return
         while not self._stop_event.is_set():
             self.adjust_once()
-            time.sleep(self.interval_s)
+            self._stop_event.wait(timeout=self.interval_s)
 
     def _read_temperature(self) -> float:
         with open(self.temp_path, "r", encoding="utf-8") as handle:

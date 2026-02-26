@@ -4,9 +4,10 @@ import os
 import pathlib
 import re
 import subprocess
+import concurrent.futures
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Callable
 
 import cv2
@@ -84,6 +85,8 @@ class CopyProgress:
 
     # show a "toast" overlay after completion/error
     toast_until: float = 0.0
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def reset_progress(p: CopyProgress) -> None:
@@ -190,16 +193,19 @@ def copy_tree_to_usb(
     progress.message = "Scanning files…"
 
     files = _iter_files(src_root)
-    progress.total_files = len(files)
-    progress.total_bytes = 0
-    progress.copied_files = 0
-    progress.copied_bytes = 0
 
+    total_bytes = 0
     for p in files:
         try:
-            progress.total_bytes += p.stat().st_size
+            total_bytes += p.stat().st_size
         except Exception:
             pass
+
+    with progress.lock:
+        progress.total_files = len(files)
+        progress.total_bytes = total_bytes
+        progress.copied_files = 0
+        progress.copied_bytes = 0
 
     if progress.total_files == 0:
         progress.phase = "finished"
@@ -211,7 +217,8 @@ def copy_tree_to_usb(
     progress.message = "Copying…"
 
     def on_bytes(n: int) -> None:
-        progress.copied_bytes += n
+        with progress.lock:
+            progress.copied_bytes += n
 
     for src in files:
         rel = src.relative_to(src_root)
@@ -220,7 +227,8 @@ def copy_tree_to_usb(
         progress.current_file = str(rel)
 
         _copy_file_chunked(src, dst, chunk_size=chunk_size, on_bytes=on_bytes)
-        progress.copied_files += 1
+        with progress.lock:
+            progress.copied_files += 1
 
         if remove_source_files:
             try:
@@ -315,14 +323,15 @@ def start_async_copy_job(
     dst_root: pathlib.Path,
 ) -> threading.Thread:
     def worker():
-        progress.running = True
-        progress.done = False
-        progress.ok = False
-        progress.error = ""
-        progress.message = ""
-        progress.current_file = ""
-        progress.phase = "mounting"
-        progress.started_at = time.time()
+        with progress.lock:
+            progress.running = True
+            progress.done = False
+            progress.ok = False
+            progress.error = ""
+            progress.message = ""
+            progress.current_file = ""
+            progress.phase = "mounting"
+            progress.started_at = time.time()
 
         _ensure_dir(mount_point)
 
@@ -345,9 +354,10 @@ def start_async_copy_job(
             copy_tree_to_usb(src_root=src_root, dst_root=dst_root, progress=progress)
 
         except Exception as e:
-            progress.error = str(e)
-            progress.ok = False
-            progress.phase = "error"
+            with progress.lock:
+                progress.error = str(e)
+                progress.ok = False
+                progress.phase = "error"
 
         finally:
             if mounted_by_us:
@@ -361,24 +371,27 @@ def start_async_copy_job(
                     )
                     if r.returncode != 0 and not progress.error:
                         out = (r.stdout.decode("utf-8", errors="replace") if r.stdout else "").strip()
-                        progress.error = out or "Error unmounting USB drive."
+                        with progress.lock:
+                            progress.error = out or "Error unmounting USB drive."
+                            progress.ok = False
+                            progress.phase = "error"
+                except Exception as e:
+                    with progress.lock:
+                        if not progress.error:
+                            progress.error = str(e)
                         progress.ok = False
                         progress.phase = "error"
-                except Exception as e:
-                    if not progress.error:
-                        progress.error = str(e)
-                    progress.ok = False
-                    progress.phase = "error"
 
-            progress.running = False
-            progress.done = True
-            progress.finished_at = time.time()
-            progress.toast_until = time.time() + 2.5
-
-            if not progress.error:
-                progress.ok = True
-                progress.phase = "finished"
-                progress.message = "Copy to USB completed."
+            now = time.time()
+            with progress.lock:
+                progress.running = False
+                progress.done = True
+                progress.finished_at = now
+                progress.toast_until = now + 2.5
+                if not progress.error:
+                    progress.ok = True
+                    progress.phase = "finished"
+                    progress.message = "Copy to USB completed."
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
@@ -468,20 +481,21 @@ def main():
     ui = CaptureUI(CLASS_NAMES, args.data_dir, args.meta_data_path, DISPLAY_W)
     prev_frame: np.ndarray | None = None
     last_frame: np.ndarray | None = None
+    last_luma = 0.0
+    prev_luma = 0.0
     last_saved_paths: list[pathlib.Path] | None = None
     last_saved_time = 0.0
+
+    # Cache the "Saved:" label width — it never changes
+    _saved_label = "Saved:"
+    _saved_label_w = cv2.getTextSize(_saved_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0][0]
 
     copy_progress = CopyProgress()
     copy_thread: Optional[threading.Thread] = None
 
-    print("Press ESC to exit. Click a class, increment instrument, then Capture.\n")
+    save_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-    def frame_luma_mean(frame: np.ndarray) -> float:
-        if frame.ndim == 3 and frame.shape[2] == 4:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-        else:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return float(np.mean(gray))
+    print("Press ESC to exit. Click a class, increment instrument, then Capture.\n")
 
     def on_mouse(event, x, y, _flags, _param):
         nonlocal prev_frame, last_frame, last_saved_paths, last_saved_time, copy_progress, copy_thread
@@ -489,13 +503,11 @@ def main():
             action = ui.handle_click(x, y)
 
             if action == "capture" and last_frame is not None and prev_frame is not None:
-                last_luma = frame_luma_mean(last_frame)
-                prev_luma = frame_luma_mean(prev_frame)
                 if last_luma >= prev_luma:
                     bright_frame, dark_frame = last_frame, prev_frame
                 else:
                     bright_frame, dark_frame = prev_frame, last_frame
-                dark_path, bright_path = ui.save_frames(dark_frame, bright_frame)
+                dark_path, bright_path = ui.save_frames_async(dark_frame, bright_frame, save_executor)
                 last_saved_paths = [bright_path, dark_path]
                 last_saved_time = time.time()
 
@@ -539,6 +551,8 @@ def main():
                 break
 
             frame_toggle = (frame_toggle + 1) % 2
+            prev_luma = last_luma
+            last_luma = float(frame[::4, ::4, 1].mean())  # green-channel subsample, no alloc
             prev_frame = last_frame
             last_frame = frame.copy()
             if frame_toggle == 0:
@@ -552,14 +566,11 @@ def main():
             # Draw last saved paths in the bottom right, above the button bar
             if last_saved_paths is not None and (time.time() - last_saved_time) < 1.5:
                 button_bar_h = max(90, int(DISPLAY_H * 0.16))
-                label = "Saved:"
-                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                label_width, _ = label_size
-                x = DISPLAY_W - label_width - 20
+                x = DISPLAY_W - _saved_label_w - 20
                 y = DISPLAY_H - button_bar_h + 30
                 cv2.putText(
                     frame,
-                    label,
+                    _saved_label,
                     (x, y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
@@ -569,8 +580,7 @@ def main():
                 )
                 for idx, path in enumerate(last_saved_paths):
                     path_text = path.name
-                    path_size, _ = cv2.getTextSize(path_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    path_width, _ = path_size
+                    path_width = cv2.getTextSize(path_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0][0]
                     px = DISPLAY_W - path_width - 20
                     py = y + (idx + 1) * 28
                     cv2.putText(
@@ -591,6 +601,7 @@ def main():
                 break
 
     finally:
+        save_executor.shutdown(wait=True)
         lens_controller.stop()
         lens_controller.join(timeout=2.0)
         cap.release()
