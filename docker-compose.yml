@@ -39,5 +39,4 @@ services:
       - /tmp/argus_socket:/tmp/argus_socket
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /tmp:/tmp
-      - /mnt/usb:/mnt/usb
       - /dev:/dev
