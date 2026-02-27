@@ -335,7 +335,7 @@ class CaptureUI:
 
         # Progress bar
         bar_x0 = x0 + 18
-        bar_y0 = y0 + box_h - 42
+        bar_y0 = y0 + box_h - 28
         bar_x1 = x1 - 18
         bar_y1 = bar_y0 + 18
 
