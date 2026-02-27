@@ -292,7 +292,7 @@ class CaptureUI:
         cv2.addWeighted(self._scratch, 0.25, frame, 0.75, 0, frame)
 
         # Box background — reuse scratch (still all-black), fill box region and blend in-place
-        self._scratch[y0:y1, x0:x1] = (20, 20, 20)
+        self._scratch[y0:y1, x0:x1] = (20, 20, 20, 255)
         cv2.addWeighted(self._scratch[y0:y1, x0:x1], 0.75, frame[y0:y1, x0:x1], 0.25, 0, frame[y0:y1, x0:x1])
 
         # Border
